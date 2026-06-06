@@ -104,7 +104,7 @@ export default function DashboardPage() {
       if (sessions && sessions.length > 0) {
         const completed = sessions.filter((s: { status: string }) => s.status === 'completed');
         if (completed.length > 0) {
-          const latest = completed[completed.length - 1];
+          const latest = completed[0];
           const r = await api.getReport(latest.id);
           setReport(r);
         }
