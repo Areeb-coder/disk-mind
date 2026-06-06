@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="DiskMind.Api\DiskMind.Api.csproj" />
+  <Project Path="DiskMind.Core\DiskMind.Core.csproj" />
+</Solution>
