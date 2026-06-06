@@ -92,6 +92,7 @@ export default function RecommendationsPage() {
       setSelected(new Set());
       const h = await api.getHistory();
       setHistory(Array.isArray(h) ? h : []);
+      await loadRecs(sessionId);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Cleanup failed');
     } finally {

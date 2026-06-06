@@ -59,6 +59,8 @@ public class CleanupService
             "SELECT COALESCE(SUM(size_bytes),0) FROM scanned_files WHERE session_id=@s AND category='Temporary Files'",
             new { s = sessionId });
         if (tempSize > 0)
+        {
+            var userTemp = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Temp");
             recs.Add(new CleanupRecommendation
             {
                 Title = "User Temporary Directory",
@@ -66,10 +68,9 @@ public class CleanupService
                 Category = "Temporary Files",
                 RiskLevel = "Safe", RiskScore = 1,
                 EstimatedBytes = tempSize,
-                Paths = new List<string> {
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Temp")
-                }
+                Paths = new List<string> { userTemp }
             });
+        }
 
         var systemTemp = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Temp");
         if (Directory.Exists(systemTemp))
@@ -92,14 +93,20 @@ public class CleanupService
             "SELECT COALESCE(SUM(size_bytes),0) FROM scanned_files WHERE session_id=@s AND category='Browser Cache'",
             new { s = sessionId });
         if (browserCacheSize > 0)
+        {
+            var cacheFiles = await conn.QueryAsync<string>(
+                "SELECT full_path FROM scanned_files WHERE session_id=@s AND category='Browser Cache' LIMIT 5000",
+                new { s = sessionId });
             recs.Add(new CleanupRecommendation
             {
                 Title = "Browser Cache Files",
                 Description = "Cached website data from Chrome, Edge, Firefox etc.",
                 Category = "Browser Cache",
                 RiskLevel = "Safe", RiskScore = 1,
-                EstimatedBytes = browserCacheSize
+                EstimatedBytes = browserCacheSize,
+                Paths = cacheFiles.ToList()
             });
+        }
 
         // Windows Update cache
         var wuPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "SoftwareDistribution", "Download");
@@ -123,28 +130,52 @@ public class CleanupService
             "SELECT COALESCE(SUM(total_wasted_bytes),0) as wasted, COUNT(*) as cnt FROM duplicate_groups WHERE session_id=@s",
             new { s = sessionId });
         if (dupeStats != null && (long)(dupeStats.wasted ?? 0) > 0)
+        {
+            var dupePaths = new List<string>();
+            var groupsList = await conn.QueryAsync<dynamic>(
+                "SELECT file_hash FROM duplicate_groups WHERE session_id=@s",
+                new { s = sessionId });
+            foreach (var g in groupsList)
+            {
+                string hash = g.file_hash;
+                var files = await conn.QueryAsync<string>(
+                    "SELECT full_path FROM scanned_files WHERE session_id=@s AND duplicate_hash=@h ORDER BY last_modified DESC",
+                    new { s = sessionId, h = hash });
+                if (files.Count() > 1)
+                {
+                    dupePaths.AddRange(files.Skip(1));
+                }
+            }
             recs.Add(new CleanupRecommendation
             {
                 Title = $"Duplicate Files ({dupeStats.cnt} groups)",
                 Description = "Files with identical content detected. Keep one copy, remove duplicates.",
                 Category = "Duplicates",
                 RiskLevel = "Moderate", RiskScore = 4,
-                EstimatedBytes = (long)(dupeStats.wasted ?? 0)
+                EstimatedBytes = (long)(dupeStats.wasted ?? 0),
+                Paths = dupePaths
             });
+        }
 
         // Developer: node_modules
         var nodeSize = await conn.ExecuteScalarAsync<long>(
             "SELECT COALESCE(SUM(size_bytes),0) FROM developer_storage WHERE session_id=@s AND tool_type='node_modules'",
             new { s = sessionId });
         if (nodeSize > 100_000_000)
+        {
+            var nodePaths = await conn.QueryAsync<string>(
+                "SELECT path FROM developer_storage WHERE session_id=@s AND tool_type='node_modules'",
+                new { s = sessionId });
             recs.Add(new CleanupRecommendation
             {
                 Title = "Stale node_modules Directories",
                 Description = "Old node_modules folders. Run 'npm install' to restore when needed.",
                 Category = "Developer Tools",
                 RiskLevel = "Caution", RiskScore = 5,
-                EstimatedBytes = nodeSize
+                EstimatedBytes = nodeSize,
+                Paths = nodePaths.Where(p => !string.IsNullOrEmpty(p)).ToList()
             });
+        }
 
         return recs.OrderBy(r => r.RiskScore).ToList();
     }
@@ -180,10 +211,14 @@ public class CleanupService
                         try { File.Move(path, backupPath); } catch { File.Delete(path); backupPath = ""; }
                         var info = new FileInfo(backupPath.Length > 0 ? backupPath : path);
                         result.FilesDeleted++;
-                        result.BytesFreed += rec.EstimatedBytes / Math.Max(rec.Paths.Count, 1);
+                        result.BytesFreed += info.Exists ? info.Length : 0;
                         await conn.ExecuteAsync(
                             "INSERT INTO cleanup_items(id,execution_id,original_path,backup_path,size_bytes) VALUES(@id,@eid,@op,@bp,@sz)",
                             new { id = Guid.NewGuid().ToString("N"), eid = executionId, op = path, bp = backupPath, sz = info.Exists ? info.Length : 0 }, tx);
+
+                        await conn.ExecuteAsync(
+                            "DELETE FROM scanned_files WHERE session_id=@s AND full_path=@p",
+                            new { s = sessionId, p = path }, tx);
                     }
                     else if (Directory.Exists(path))
                     {
@@ -201,6 +236,10 @@ public class CleanupService
                                 await conn.ExecuteAsync(
                                     "INSERT INTO cleanup_items(id,execution_id,original_path,backup_path,size_bytes) VALUES(@id,@eid,@op,@bp,@sz)",
                                     new { id = Guid.NewGuid().ToString("N"), eid = executionId, op = f, bp = backupPath, sz = fi.Length }, tx);
+
+                                await conn.ExecuteAsync(
+                                    "DELETE FROM scanned_files WHERE session_id=@s AND full_path=@p",
+                                    new { s = sessionId, p = f }, tx);
                             }
                             catch (Exception ex) { result.Errors.Add($"{f}: {ex.Message}"); }
                         }
@@ -209,6 +248,12 @@ public class CleanupService
                 catch (Exception ex) { result.Errors.Add($"{path}: {ex.Message}"); }
             }
         }
+
+        // Clean up empty duplicate groups after deletions
+        await conn.ExecuteAsync(
+            @"DELETE FROM duplicate_groups WHERE session_id=@s AND file_hash NOT IN (
+                SELECT duplicate_hash FROM scanned_files WHERE session_id=@s AND is_duplicate=1 AND duplicate_hash IS NOT NULL GROUP BY duplicate_hash HAVING COUNT(*) > 1
+            )", new { s = sessionId }, tx);
 
         await conn.ExecuteAsync(
             "INSERT INTO cleanup_executions(id,executed_at,session_id,files_deleted,bytes_freed,rollback_path,status) VALUES(@id,@t,@s,@f,@b,@r,'completed')",
