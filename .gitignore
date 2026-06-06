@@ -1,0 +1,62 @@
+# ============================================================
+# DiskMind - .gitignore
+# ============================================================
+
+# -----------------------------------------------
+# SECURITY - Never commit these
+# -----------------------------------------------
+frontend/public/config.json
+**/client_token.txt
+**/*.db
+**/*.db-shm
+**/*.db-wal
+appsettings.Development.json
+appsettings.Local.json
+.env
+.env.local
+.env.*.local
+
+# -----------------------------------------------
+# Frontend - Next.js
+# -----------------------------------------------
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/.pnpm-debug.log*
+
+# -----------------------------------------------
+# Backend - .NET
+# -----------------------------------------------
+backend/**/bin/
+backend/**/obj/
+backend/**/*.user
+backend/**/*.suo
+backend/.vs/
+*.DotSettings.user
+
+# -----------------------------------------------
+# OS Files
+# -----------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -----------------------------------------------
+# IDE / Editor
+# -----------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# -----------------------------------------------
+# Logs & Temp
+# -----------------------------------------------
+*.log
+*.tmp
+*.temp
