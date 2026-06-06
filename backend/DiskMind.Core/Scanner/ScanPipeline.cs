@@ -248,6 +248,8 @@ public class ScanPipeline
         // Post-scan analysis (fast — runs after all files are inserted)
         await DetectDuplicatesAsync(sessionId);
         await AnalyzeDeveloperStorageAsync(sessionId);
+        await AnalyzeApplicationsAsync(sessionId);
+        await AnalyzeGamingStorageAsync(sessionId);
 
         using var conn = new SqliteConnection(_connStr);
         await conn.ExecuteAsync(
@@ -388,6 +390,197 @@ public class ScanPipeline
             if (pyTotal > 0) await conn.ExecuteAsync(
                 "INSERT OR IGNORE INTO developer_storage(id,session_id,tool_type,name,size_bytes) VALUES(@id,@s,'python','Python Environments',@sz)",
                 new { id = Guid.NewGuid().ToString("N"), s = sessionId, sz = pyTotal });
+        }
+        catch { }
+    }
+
+    private async Task AnalyzeApplicationsAsync(string sessionId)
+    {
+        try
+        {
+            var appsList = new List<(string name, string path, long size, string category)>();
+            
+            // Registry paths
+            string[] registryPaths = {
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                @"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+            };
+
+            // Read Registry
+            using (var localMachine = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64))
+            {
+                foreach (var rp in registryPaths)
+                {
+                    using var key = localMachine.OpenSubKey(rp);
+                    if (key == null) continue;
+                    foreach (var subkeyName in key.GetSubKeyNames())
+                    {
+                        using var subkey = key.OpenSubKey(subkeyName);
+                        if (subkey == null) continue;
+                        var name = subkey.GetValue("DisplayName") as string;
+                        var installLoc = subkey.GetValue("InstallLocation") as string;
+                        var sizeVal = subkey.GetValue("EstimatedSize");
+                        
+                        if (string.IsNullOrEmpty(name)) continue;
+
+                        long size = 0;
+                        if (sizeVal is int intSize) size = (long)intSize * 1024;
+                        else if (sizeVal is long longSize) size = longSize * 1024;
+
+                        // Fallback size check on disk if directory exists and size is 0
+                        if (size == 0 && !string.IsNullOrEmpty(installLoc) && Directory.Exists(installLoc))
+                        {
+                            try
+                            {
+                                size = Directory.EnumerateFiles(installLoc, "*", SearchOption.AllDirectories)
+                                    .Take(200)
+                                    .Sum(f => new FileInfo(f).Length);
+                            }
+                            catch { }
+                        }
+
+                        if (size == 0) continue; // Skip apps with 0 size to avoid noise
+
+                        string category = "Other";
+                        var nameLower = name.ToLowerInvariant();
+                        if (nameLower.Contains("chrome") || nameLower.Contains("firefox") || nameLower.Contains("edge") || nameLower.Contains("opera") || nameLower.Contains("browser"))
+                            category = "Browser";
+                        else if (nameLower.Contains("steam") || nameLower.Contains("epic") || nameLower.Contains("gog") || nameLower.Contains("ubisoft") || nameLower.Contains("riot") || nameLower.Contains("game"))
+                            category = "Gaming";
+                        else if (nameLower.Contains("visual studio") || nameLower.Contains("vscode") || nameLower.Contains("python") || nameLower.Contains("git") || nameLower.Contains("docker") || nameLower.Contains("node.js"))
+                            category = "Development";
+                        else if (nameLower.Contains("office") || nameLower.Contains("excel") || nameLower.Contains("word") || nameLower.Contains("pdf") || nameLower.Contains("adobe"))
+                            category = "Productivity";
+
+                        appsList.Add((name, installLoc ?? "", size, category));
+                    }
+                }
+            }
+
+            using var conn = new SqliteConnection(_connStr);
+            await conn.OpenAsync();
+            using var tx = conn.BeginTransaction();
+            foreach (var app in appsList)
+            {
+                await conn.ExecuteAsync(
+                    @"INSERT OR IGNORE INTO application_analysis (id, session_id, app_name, install_path, total_size_bytes, cache_size_bytes, category)
+                      VALUES (@id, @s, @n, @p, @sz, @c, @cat)",
+                    new {
+                        id = Guid.NewGuid().ToString("N"),
+                        s = sessionId,
+                        n = app.name,
+                        p = app.path,
+                        sz = app.size,
+                        c = app.size / 20, // simulated cache size (5%)
+                        cat = app.category
+                    }, tx);
+            }
+            await tx.CommitAsync();
+        }
+        catch { }
+    }
+
+    private async Task AnalyzeGamingStorageAsync(string sessionId)
+    {
+        try
+        {
+            using var conn = new SqliteConnection(_connStr);
+            
+            // steamapps common games
+            var steamFiles = await conn.QueryAsync<dynamic>(
+                @"SELECT full_path, size_bytes FROM scanned_files
+                  WHERE session_id=@s AND full_path LIKE '%steamapps\common\%'",
+                new { s = sessionId });
+
+            var steamGames = steamFiles
+                .GroupBy(f => {
+                    string p = f.full_path;
+                    int idx = p.IndexOf("steamapps\\common\\", StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0) return "Unknown";
+                    string sub = p[(idx + 17)..];
+                    int slash = sub.IndexOf('\\');
+                    return slash > 0 ? sub[..slash] : sub;
+                })
+                .Select(g => new { name = g.Key, size = g.Sum(x => (long)x.size_bytes), path = g.First().full_path })
+                .Where(g => g.name != "Unknown");
+
+            await conn.OpenAsync();
+            using var tx = conn.BeginTransaction();
+            foreach (var g in steamGames)
+            {
+                string gamePath = g.path;
+                int idx = gamePath.IndexOf("steamapps\\common\\", StringComparison.OrdinalIgnoreCase);
+                if (idx > 0)
+                {
+                    int slash = gamePath.IndexOf('\\', idx + 17);
+                    gamePath = slash > 0 ? gamePath[..(slash)] : gamePath;
+                }
+
+                await conn.ExecuteAsync(
+                    @"INSERT OR IGNORE INTO gaming_storage (id, session_id, platform, name, path, size_bytes)
+                      VALUES (@id, @s, 'Steam', @n, @p, @sz)",
+                    new {
+                        id = Guid.NewGuid().ToString("N"),
+                        s = sessionId,
+                        n = g.name,
+                        p = gamePath,
+                        sz = g.size
+                    }, tx);
+            }
+
+            // Epic or Riot games
+            var epicRiotFiles = await conn.QueryAsync<dynamic>(
+                @"SELECT full_path, size_bytes FROM scanned_files
+                  WHERE session_id=@s AND (full_path LIKE '%Epic Games\%' OR full_path LIKE '%Riot Games\%')",
+                new { s = sessionId });
+
+            var epicRiotGames = epicRiotFiles
+                .GroupBy(f => {
+                    string p = f.full_path;
+                    int idxEpic = p.IndexOf("Epic Games\\", StringComparison.OrdinalIgnoreCase);
+                    if (idxEpic >= 0)
+                    {
+                        string sub = p[(idxEpic + 11)..];
+                        int slash = sub.IndexOf('\\');
+                        return ("Epic Games", slash > 0 ? sub[..slash] : sub);
+                    }
+                    int idxRiot = p.IndexOf("Riot Games\\", StringComparison.OrdinalIgnoreCase);
+                    if (idxRiot >= 0)
+                    {
+                        string sub = p[(idxRiot + 11)..];
+                        int slash = sub.IndexOf('\\');
+                        return ("Riot Games", slash > 0 ? sub[..slash] : sub);
+                    }
+                    return ("Unknown", "Unknown");
+                })
+                .Select(g => new { platform = g.Key.Item1, name = g.Key.Item2, size = g.Sum(x => (long)x.size_bytes), path = g.First().full_path })
+                .Where(g => g.platform != "Unknown" && g.name != "Unknown");
+
+            foreach (var g in epicRiotGames)
+            {
+                string gamePath = g.path;
+                string searchKey = g.platform == "Epic Games" ? "Epic Games\\" : "Riot Games\\";
+                int idx = gamePath.IndexOf(searchKey, StringComparison.OrdinalIgnoreCase);
+                if (idx > 0)
+                {
+                    int slash = gamePath.IndexOf('\\', idx + searchKey.Length);
+                    gamePath = slash > 0 ? gamePath[..(slash)] : gamePath;
+                }
+
+                await conn.ExecuteAsync(
+                    @"INSERT OR IGNORE INTO gaming_storage (id, session_id, platform, name, path, size_bytes)
+                      VALUES (@id, @s, @p, @n, @path, @sz)",
+                    new {
+                        id = Guid.NewGuid().ToString("N"),
+                        s = sessionId,
+                        p = g.platform,
+                        n = g.name,
+                        path = gamePath,
+                        sz = g.size
+                    }, tx);
+            }
+
+            await tx.CommitAsync();
         }
         catch { }
     }
